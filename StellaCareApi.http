@@ -1,0 +1,30 @@
+@StellaCareApi_HostAddress = http://localhost:5153
+
+# The three devices in the simulated dataset:
+#   sc-dev-stuck-active  - stuck in Active Tracking (critical battery)
+#   sc-dev-walker-car    - moves on foot and by car
+#   sc-dev-mostly-home   - mostly at home on wifi
+
+### Recommended mode for a device (the core call)
+GET {{StellaCareApi_HostAddress}}/devices/sc-dev-walker-car/recommended-mode
+Accept: application/json
+
+### Devices currently in an abnormal state
+GET {{StellaCareApi_HostAddress}}/devices/deviations
+Accept: application/json
+
+### Set desired battery life (allowed: 12, 24, 36, 48, 72)
+POST {{StellaCareApi_HostAddress}}/devices/sc-dev-mostly-home/config
+Content-Type: application/json
+
+{ "targetBatteryHours": 48 }
+
+### Start a search -> forces Active Tracking
+POST {{StellaCareApi_HostAddress}}/devices/sc-dev-mostly-home/activate-search
+Content-Type: application/json
+
+{ "initiator": "app.staff" }
+
+### End a search -> algorithm picks a normal mode
+POST {{StellaCareApi_HostAddress}}/devices/sc-dev-mostly-home/deactivate-search
+Accept: application/json

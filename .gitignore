@@ -1,0 +1,19 @@
+# Build output
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+*.user
+
+# Test results
+[Tt]est[Rr]esults/
+*.trx
+
+# Rider / VS / VS Code
+.idea/
+.vs/
+*.suo
+
+# OS
+.DS_Store
+Thumbs.db

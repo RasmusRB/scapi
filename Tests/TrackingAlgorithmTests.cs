@@ -1,0 +1,155 @@
+using StellaCareApi.Managers;
+using StellaCareApi.Models;
+using Xunit;
+
+namespace StellaCareApi.Tests;
+
+/// <summary>
+/// Exercises the algorithm's priority order (safety first, battery second). Each test
+/// isolates one branch by constructing just enough device state + history.
+/// </summary>
+public class TrackingAlgorithmTests
+{
+    private static readonly DateTimeOffset Now = new(2026, 7, 1, 12, 0, 0, TimeSpan.Zero);
+    private readonly TrackingAlgorithm _algo = new();
+
+    // --- 1. Active, valid search wins over everything ---------------------
+
+    [Fact]
+    public void ActiveSearch_WithinTimeout_ForcesActiveTracking()
+    {
+        var state = Device(mode: TrackingMode.WorkingMode8);
+        state.ActiveSearch = new ActiveSearch("activated", Now.AddMinutes(-10), "carer", null);
+
+        var r = _algo.Recommend(state, NoHistory, Now);
+
+        Assert.Equal(nameof(TrackingMode.ActiveTracking), r.RecommendedMode);
+        Assert.Equal(15, r.IntervalSeconds);
+        Assert.False(r.IsDeviation);
+    }
+
+    // --- 2. Search past the auto-timeout is a deviation -------------------
+
+    [Fact]
+    public void ActiveSearch_PastTimeout_FlagsSearchTimeout()
+    {
+        var state = Device(mode: TrackingMode.ActiveTracking);
+        state.ActiveSearch = new ActiveSearch("activated", Now.AddHours(-3), "carer", null);
+
+        var r = _algo.Recommend(state, NoHistory, Now);
+
+        Assert.True(r.IsDeviation);
+        Assert.Equal("search_timeout", r.DeviationKind);
+        Assert.NotEqual(nameof(TrackingMode.ActiveTracking), r.RecommendedMode);
+    }
+
+    // --- 3. Stuck in Active Tracking with no search ----------------------
+
+    [Fact]
+    public void ActiveTracking_NoSearch_PastGrace_FlagsStuck()
+    {
+        var state = Device(mode: TrackingMode.ActiveTracking, modeStartedAt: Now.AddHours(-2));
+
+        var r = _algo.Recommend(state, NoHistory, Now);
+
+        Assert.True(r.IsDeviation);
+        Assert.Equal("stuck_active_tracking", r.DeviationKind);
+    }
+
+    [Fact]
+    public void ActiveTracking_NoSearch_WithinGrace_IsNormalWindDown()
+    {
+        var state = Device(mode: TrackingMode.ActiveTracking, modeStartedAt: Now.AddMinutes(-5));
+
+        var r = _algo.Recommend(state, NoHistory, Now);
+
+        Assert.False(r.IsDeviation);
+        Assert.Null(r.DeviationKind);
+        Assert.NotEqual(nameof(TrackingMode.ActiveTracking), r.RecommendedMode);
+    }
+
+    // --- 4. Home wifi -> WiFi Saver --------------------------------------
+
+    [Fact]
+    public void HomeWifiVisible_ReturnsWifiSaver()
+    {
+        var state = Device(mode: TrackingMode.WorkingMode8);
+        state.InWifiSaver = true;
+        state.WifiVisibleNow = new List<string> { "home-net" };
+
+        var r = _algo.Recommend(state, NoHistory, Now);
+
+        Assert.Equal(nameof(TrackingMode.WifiSaver), r.RecommendedMode);
+        Assert.False(r.IsDeviation);
+    }
+
+    // --- 5. Normal mode selection ----------------------------------------
+
+    [Fact]
+    public void FastMovingWithFlatSteps_DetectedAsCar_UsesWorkingMode8()
+    {
+        var state = Device(mode: TrackingMode.WorkingMode9);
+        var history = new[]
+        {
+            Report(Now.AddMinutes(-10), speedKmh: 30, stepsToday: 1000),
+            Report(Now.AddMinutes(-3), speedKmh: 35, stepsToday: 1000), // steps flat -> not walking
+        };
+
+        var r = _algo.Recommend(state, history, Now);
+
+        Assert.Equal(nameof(TrackingMode.WorkingMode8), r.RecommendedMode);
+        Assert.False(r.IsDeviation);
+    }
+
+    [Fact]
+    public void WalkingOnFoot_UsesWorkingMode9()
+    {
+        var state = Device(mode: TrackingMode.WorkingMode8);
+        var history = new[]
+        {
+            Report(Now.AddMinutes(-10), speedKmh: 4, stepsToday: 100),
+            Report(Now.AddMinutes(-3), speedKmh: 4, stepsToday: 180),
+        };
+
+        var r = _algo.Recommend(state, history, Now);
+
+        Assert.Equal(nameof(TrackingMode.WorkingMode9), r.RecommendedMode);
+        Assert.Equal(300, r.StepThreshold); // 24h profile
+    }
+
+    [Fact]
+    public void MostlyStationary_UsesWorkingMode8FixedInterval()
+    {
+        var state = Device(mode: TrackingMode.WorkingMode9);
+        var history = new[]
+        {
+            Report(Now.AddMinutes(-10), speedKmh: 0, stepsToday: 500),
+            Report(Now.AddMinutes(-3), speedKmh: 0, stepsToday: 500),
+        };
+
+        var r = _algo.Recommend(state, history, Now);
+
+        Assert.Equal(nameof(TrackingMode.WorkingMode8), r.RecommendedMode);
+        Assert.Equal(300, r.IntervalSeconds); // 24h profile fixed interval
+    }
+
+    // --- helpers ----------------------------------------------------------
+
+    private static readonly IReadOnlyList<PositionReport> NoHistory = Array.Empty<PositionReport>();
+
+    private static DeviceState Device(
+        TrackingMode mode,
+        DateTimeOffset? modeStartedAt = null,
+        int targetBatteryHours = 24) => new()
+    {
+        DeviceId = "test-dev",
+        At = Now,
+        BatteryPct = 80,
+        CurrentMode = mode,
+        ModeStartedAt = modeStartedAt ?? Now,
+        TargetBatteryHours = targetBatteryHours,
+    };
+
+    private static PositionReport Report(DateTimeOffset ts, double speedKmh, int stepsToday) =>
+        new(ts, 55.0, 12.0, 90, TrackingMode.WorkingMode9, stepsToday, speedKmh, Array.Empty<string>(), false);
+}
