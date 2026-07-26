@@ -114,7 +114,12 @@ public class TrackingAlgorithmTests
         var r = _algo.Recommend(state, history, Now);
 
         Assert.Equal(nameof(TrackingMode.WorkingMode9), r.RecommendedMode);
-        Assert.Equal(300, r.StepThreshold); // 24h profile
+        // Derived from the battery model for a 24h target: step-triggered fixes are cheap, so
+        // the model spends its budget on a low threshold (100 steps) and a 10-min fallback,
+        // reaching ~32h. The old hand-written table guessed 300 steps / 20-min here.
+        Assert.Equal(100, r.StepThreshold);
+        Assert.Equal(600, r.FallbackIntervalSeconds);
+        Assert.True(r.ExpectedBatteryHoursRemaining >= 24);
     }
 
     [Fact]
@@ -229,6 +234,77 @@ public class TrackingAlgorithmTests
         var r = _algo.Recommend(state, history, Now);
 
         Assert.Equal(nameof(TrackingMode.WorkingMode8), r.RecommendedMode);
+    }
+
+    // --- battery model vs. the target profile -----------------------------
+    //
+    // These are the regression guard for the bug where the hand-written parameter table and
+    // the drain model disagreed: the table said a 5-min WM8 interval "meets the 24h target"
+    // while the model priced the same interval at 8.2 %/h, i.e. 12 hours. Now the table is
+    // derived from the model, so the two can't drift apart again.
+
+    [Theory]
+    [InlineData(12)]
+    [InlineData(24)]
+    [InlineData(36)]
+    [InlineData(48)]
+    [InlineData(72)]
+    public void RecommendedParameters_EitherMeetTheBatteryTarget_OrSayTheyDoNot(int targetHours)
+    {
+        // Stationary resident => WM8; the mode whose parameters are driven purely by the target.
+        var state = Device(mode: TrackingMode.WorkingMode8, targetBatteryHours: targetHours);
+        state.BatteryPct = 100;
+
+        var r = _algo.Recommend(state, NoHistory, Now);
+
+        if (r.ExpectedBatteryHoursRemaining >= targetHours)
+            Assert.Contains($"meets the {targetHours}h battery target", r.Rationale);
+        else
+            Assert.Contains($"does NOT reach the {targetHours}h target", r.Rationale);
+    }
+
+    [Fact]
+    public void UnreachableTarget_IsReportedHonestly_NotSilentlyClaimedMet()
+    {
+        // 72h with GPS on is not achievable: even a 30-min WM8 interval only reaches ~67h.
+        // The old code claimed every target was met regardless.
+        var state = Device(mode: TrackingMode.WorkingMode8, targetBatteryHours: 72);
+        state.BatteryPct = 100;
+
+        var r = _algo.Recommend(state, NoHistory, Now);
+
+        Assert.True(r.ExpectedBatteryHoursRemaining < 72);
+        Assert.Contains("does NOT reach the 72h target", r.Rationale);
+        Assert.Contains("WiFi Saver", r.Rationale);
+    }
+
+    [Fact]
+    public void ShorterBatteryTarget_BuysMoreFrequentReporting()
+    {
+        // The whole point of the setting: 12h must track at least as tightly as 48h.
+        var aggressive = _algo.Recommend(Device(TrackingMode.WorkingMode8, targetBatteryHours: 12), NoHistory, Now);
+        var conservative = _algo.Recommend(Device(TrackingMode.WorkingMode8, targetBatteryHours: 48), NoHistory, Now);
+
+        Assert.True(aggressive.IntervalSeconds < conservative.IntervalSeconds);
+        Assert.True(aggressive.ExpectedDrainPctPerHour > conservative.ExpectedDrainPctPerHour);
+    }
+
+    [Fact]
+    public void DrainModel_IsCalibratedAgainstTheDataset()
+    {
+        // Observed in the 14 days of history: active_tracking ~13.9 %/h, wifi_saver ~1.2 %/h.
+        // A naive linear per-fix model predicted ~60 %/h for Active Tracking; the ceiling that
+        // represents "the receiver never powers down at 15s" is what brings it back to reality.
+        var searching = Device(mode: TrackingMode.WorkingMode8);
+        searching.ActiveSearch = new ActiveSearch("activated", Now.AddMinutes(-5), "carer", null);
+        var active = _algo.Recommend(searching, NoHistory, Now);
+        Assert.InRange(active.ExpectedDrainPctPerHour, 12.0, 16.0);
+
+        var home = Device(mode: TrackingMode.WorkingMode9);
+        home.InWifiSaver = true;
+        home.WifiVisibleNow.Add("Beboer-Hjem");
+        var saver = _algo.Recommend(home, NoHistory, Now);
+        Assert.InRange(saver.ExpectedDrainPctPerHour, 0.8, 1.6);
     }
 
     // --- helpers ----------------------------------------------------------

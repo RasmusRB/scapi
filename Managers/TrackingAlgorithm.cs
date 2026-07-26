@@ -96,7 +96,9 @@ public class TrackingAlgorithm : ITrackingAlgorithm
         var highSpeed = recent.Any(r => r.SpeedKmh >= CarSpeedKmh);
         if (highSpeed && StepsFlat(recent))
         {
-            var carInterval = Math.Min(profile.Interval, 180); // cap at 3 min while moving fast
+            // Safety overrides the battery target here: a resident in a car is the case where
+            // losing them is most likely, so we tighten the interval past what the target buys.
+            var carInterval = Math.Min(profile.Wm8IntervalSeconds, CarIntervalSeconds);
             return BuildNormal(s, TrackingMode.WorkingMode8, carInterval, profile,
                 $"Likely car trip (speed ≥ {CarSpeedKmh:F0} km/h, step counter flat). " +
                 $"WM9 would lose them — switch to WM8 {carInterval / 60}-min fixed interval.");
@@ -122,31 +124,77 @@ public class TrackingAlgorithm : ITrackingAlgorithm
 
         return desired == TrackingMode.WorkingMode9
             ? BuildNormal(s, TrackingMode.WorkingMode9, null, profile,
-                $"Moving on foot; WM9 (every {profile.StepThreshold} steps, {profile.Fallback / 60}-min fallback) " +
-                $"fits the {s.TargetBatteryHours}h battery target.")
-            : BuildNormal(s, TrackingMode.WorkingMode8, profile.Interval, profile,
-                $"Mostly stationary; WM8 {profile.Interval / 60}-min fixed interval meets the {s.TargetBatteryHours}h battery target.");
+                $"Moving on foot; WM9 (every {profile.StepThreshold} steps, {profile.FallbackSeconds / 60}-min fallback) " +
+                TargetClause(s.TargetBatteryHours, profile.Wm9MeetsTarget, profile.Wm9Hours))
+            : BuildNormal(s, TrackingMode.WorkingMode8, profile.Wm8IntervalSeconds, profile,
+                $"Mostly stationary; WM8 {profile.Wm8IntervalSeconds / 60}-min fixed interval " +
+                TargetClause(s.TargetBatteryHours, profile.Wm8MeetsTarget, profile.Wm8Hours));
     }
+
+    /// <summary>Say honestly whether the chosen parameters actually reach the user's target.
+    /// The old code asserted "meets the Nh target" unconditionally; with the table derived from
+    /// the battery model, some targets provably can't be met with GPS on and we say so.</summary>
+    private static string TargetClause(int targetHours, bool meetsTarget, double hours) =>
+        meetsTarget
+            ? $"meets the {targetHours}h battery target (≈{hours:F0}h from a full charge)."
+            : $"does NOT reach the {targetHours}h target — ≈{hours:F0}h from a full charge is the longest " +
+              "any GPS-on setting lasts; only WiFi Saver time at home closes the rest of the gap.";
 
     /// <summary>Build a WM8 or WM9 recommendation with parameters from the target profile.
     /// Switching to WM8 clears WM9's step/fallback (and vice-versa) so a transition never
     /// carries the previous mode's stale parameters — the mode-transition-lag pitfall.</summary>
     private static ModeRecommendation BuildNormal(
-        DeviceState s, TrackingMode mode, int? intervalOverride,
-        (int Interval, int StepThreshold, int Fallback) profile, string rationale) =>
+        DeviceState s, TrackingMode mode, int? intervalOverride, ModeProfile profile, string rationale) =>
         mode == TrackingMode.WorkingMode8
-            ? Build(s, TrackingMode.WorkingMode8, intervalOverride ?? profile.Interval, null, null, false, null, rationale)
-            : Build(s, TrackingMode.WorkingMode9, null, profile.StepThreshold, profile.Fallback, false, null, rationale);
+            ? Build(s, TrackingMode.WorkingMode8, intervalOverride ?? profile.Wm8IntervalSeconds, null, null, false, null, rationale)
+            : Build(s, TrackingMode.WorkingMode9, null, profile.StepThreshold, profile.FallbackSeconds, false, null, rationale);
 
-    /// <summary>Map the desired battery life to concrete mode parameters (all values valid per the brief).</summary>
-    private static (int Interval, int StepThreshold, int Fallback) TargetProfile(int targetHours) => targetHours switch
+    // --- target profile: derived, not hard-coded --------------------------
+
+    // The parameter values the devices actually accept, per the brief.
+    private static readonly int[] Wm8IntervalOptions = { 120, 180, 240, 300, 600, 900, 1200, 1800 };
+    private static readonly int[] Wm9StepOptions = { 100, 200, 300, 400, 500, 1000 };
+    private static readonly int[] Wm9FallbackOptions = { 600, 1200, 1800, 2400 };
+
+    private const int CarIntervalSeconds = 180; // tightest interval we'll force during a car trip
+
+    /// <summary>Concrete parameters for one battery target, plus whether they actually reach it.</summary>
+    private readonly record struct ModeProfile(
+        int Wm8IntervalSeconds, bool Wm8MeetsTarget, double Wm8Hours,
+        int StepThreshold, int FallbackSeconds, bool Wm9MeetsTarget, double Wm9Hours);
+
+    /// <summary>
+    /// Turn the desired battery life into concrete mode parameters by *searching* the allowed
+    /// values with the battery model, instead of hard-coding a lookup table.
+    ///
+    /// This exists because the hand-written table and the drain model disagreed: the table
+    /// claimed a 5-minute WM8 interval "meets the 24h target" while the model priced the same
+    /// interval at 8.2 %/h — i.e. 12 hours. Deriving the table makes targetBatteryHours a real
+    /// constraint: we take the *most frequent* reporting (best tracking) that still survives the
+    /// target from a full charge, and if the constants ever change the table moves with them.
+    /// </summary>
+    private static ModeProfile TargetProfile(int targetHours)
     {
-        <= 12 => (180, 200, 600),   // 3-min WM8 / 200 steps / 10-min fallback  (aggressive)
-        <= 24 => (300, 300, 1200),  // 5-min       / 300       / 20-min          (standard)
-        <= 36 => (900, 400, 1800),  // 15-min      / 400       / 30-min          (conservative)
-        <= 48 => (1200, 500, 2400), // 20-min      / 500       / 40-min          (very conservative)
-        _ => (1800, 1000, 2400),    // 30-min      / 1000      / 40-min          (max battery)
-    };
+        // Shortest interval first = best tracking; take the first that survives the target.
+        var wm8 = Wm8IntervalOptions
+            .Select(i => (Interval: i, Hours: HoursFromFull(Wm8Drain(i))))
+            .ToList();
+        var wm8Pick = wm8.FirstOrDefault(c => c.Hours >= targetHours, wm8[^1]);
+
+        // Same idea for WM9, ranked by how often it reports (fallback fixes + step-triggered
+        // fixes). Note the model says step-triggered fixes are cheap and the *fallback* is what
+        // costs you, so this systematically prefers a low step threshold with a long fallback —
+        // the opposite of what the hand-written table assumed.
+        var wm9 = (from st in Wm9StepOptions
+                   from fb in Wm9FallbackOptions
+                   orderby Wm9FixesPerHour(st, fb) descending
+                   select (Steps: st, Fallback: fb, Hours: HoursFromFull(Wm9Drain(st, fb)))).ToList();
+        var wm9Pick = wm9.FirstOrDefault(c => c.Hours >= targetHours, wm9[^1]);
+
+        return new ModeProfile(
+            wm8Pick.Interval, wm8Pick.Hours >= targetHours, wm8Pick.Hours,
+            wm9Pick.Steps, wm9Pick.Fallback, wm9Pick.Hours >= targetHours, wm9Pick.Hours);
+    }
 
     // --- movement helpers -------------------------------------------------
 
@@ -164,24 +212,57 @@ public class TrackingAlgorithm : ITrackingAlgorithm
         return recent[^1].StepsToday - recent[0].StepsToday <= 5;
     }
 
-    // --- battery model (our own, documented assumption) -------------------
+    // --- battery model (our own assumption, calibrated against the dataset) ---
 
-    /// <summary>Estimated battery drain in %/hour. GPS is the main cost, so drain scales
-    /// with how often we take a fix. Active Tracking is pinned high; WiFi Saver near zero.</summary>
-    private static double EstimateDrainPctPerHour(TrackingMode mode, int? intervalSeconds, int? fallbackSeconds) => mode switch
+    // Calibration: the dataset's 14 days give observed drain per mode, which is what these
+    // constants are fitted to (fractional battery in the history makes this measurable):
+    //   active_tracking ~13.9 %/h · WM9 ~1.6-5.0 %/h · wifi_saver ~1.2 %/h
+    //
+    // Shape of the model: drain = idle + (cost of a GPS fix) x (fixes per hour), with a ceiling
+    // on the GPS term. The ceiling is the interesting part — a naive linear model priced Active
+    // Tracking at 240 cold fixes an hour and predicted ~60 %/h, four times what the data shows.
+    // Below roughly a 70-second interval the receiver never powers down between fixes: it tracks
+    // continuously, so there is no cold-acquisition cost to pay per fix and the drain saturates.
+
+    private const double IdleDrainPctPerHour = 1.0;      // radio + housekeeping, GPS off
+    private const double CostPerFixPct = 0.25;           // one cold GPS acquisition
+    private const double ContinuousGpsPctPerHour = 12.9; // ceiling: receiver stays hot (=> AT ~13.9 %/h)
+    private const double WifiSaverDrainPctPerHour = 1.2; // GPS off entirely, passive scanning only
+
+    /// <summary>Steps per hour assumed when pricing WM9's step-triggered fixes. ~2 500 steps
+    /// over a 10-hour waking day, which is what the dataset's walker device actually does.
+    /// Per-resident history would beat this constant — see the README's known limitation.</summary>
+    private const double AssumedStepsPerActiveHour = 250.0;
+
+    private static double DrainForFixRate(double fixesPerHour) =>
+        IdleDrainPctPerHour + Math.Min(CostPerFixPct * fixesPerHour, ContinuousGpsPctPerHour);
+
+    private static double HoursFromFull(double drainPctPerHour) => 100.0 / drainPctPerHour;
+
+    private static double Wm8Drain(int intervalSeconds) =>
+        DrainForFixRate(3600.0 / Math.Max(intervalSeconds, 1));
+
+    /// <summary>WM9 reports on the fallback timer *and* every N steps, so both count.</summary>
+    private static double Wm9FixesPerHour(int stepThreshold, int fallbackSeconds) =>
+        3600.0 / Math.Max(fallbackSeconds, 1) + AssumedStepsPerActiveHour / Math.Max(stepThreshold, 1);
+
+    private static double Wm9Drain(int stepThreshold, int fallbackSeconds) =>
+        DrainForFixRate(Wm9FixesPerHour(stepThreshold, fallbackSeconds));
+
+    private static double EstimateDrainPctPerHour(TrackingMode mode, int? intervalSeconds, int? stepThreshold, int? fallbackSeconds) => mode switch
     {
-        TrackingMode.ActiveTracking => 25.0,
-        TrackingMode.WifiSaver => 0.4,
-        TrackingMode.WorkingMode8 => 1.0 + 3600.0 / Math.Max(intervalSeconds ?? 300, 1) * 0.6,
-        TrackingMode.WorkingMode9 => 1.0 + 3600.0 / Math.Max(fallbackSeconds ?? 1800, 1) * 0.5,
-        _ => 2.0
+        TrackingMode.ActiveTracking => Wm8Drain(15),
+        TrackingMode.WifiSaver => WifiSaverDrainPctPerHour,
+        TrackingMode.WorkingMode8 => Wm8Drain(intervalSeconds ?? 300),
+        TrackingMode.WorkingMode9 => Wm9Drain(stepThreshold ?? 300, fallbackSeconds ?? 1800),
+        _ => DrainForFixRate(1),
     };
 
     private static ModeRecommendation Build(
         DeviceState s, TrackingMode mode, int? interval, int? steps, int? fallback,
         bool isDeviation, string? deviationKind, string rationale)
     {
-        var drain = EstimateDrainPctPerHour(mode, interval, fallback);
+        var drain = EstimateDrainPctPerHour(mode, interval, steps, fallback);
         var hoursLeft = drain > 0 ? s.BatteryPct / drain : double.PositiveInfinity;
         return new ModeRecommendation(
             s.DeviceId,
