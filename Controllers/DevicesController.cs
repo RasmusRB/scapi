@@ -23,11 +23,10 @@ public class DevicesController : ControllerBase
     [HttpGet("{id}/recommended-mode")]
     public ActionResult<ModeRecommendation> GetRecommendedMode(string id)
     {
-        var state = _store.GetState(id);
-        if (state is null) return NotFound($"Unknown device '{id}'.");
+        var snapshot = _store.Snapshot(id);
+        if (snapshot is null) return NotFound($"Unknown device '{id}'.");
 
-        var recommendation = _algorithm.Recommend(state, _store.History(id), _store.EffectiveNow(id));
-        return Ok(recommendation);
+        return Ok(Recommend(snapshot));
     }
 
     /// <summary>Update the user's desired battery life.</summary>
@@ -47,20 +46,20 @@ public class DevicesController : ControllerBase
     [HttpPost("{id}/activate-search")]
     public IActionResult ActivateSearch(string id, [FromBody] ActivateSearchRequest? request)
     {
-        if (!_store.ActivateSearch(id, request?.Initiator))
-            return NotFound($"Unknown device '{id}'.");
+        var snapshot = _store.ActivateSearch(id, request?.Initiator);
+        if (snapshot is null) return NotFound($"Unknown device '{id}'.");
 
-        return Ok(_algorithm.Recommend(_store.GetState(id)!, _store.History(id), _store.EffectiveNow(id)));
+        return Ok(Recommend(snapshot));
     }
 
     /// <summary>End a search and let the algorithm pick a normal mode.</summary>
     [HttpPost("{id}/deactivate-search")]
     public IActionResult DeactivateSearch(string id)
     {
-        if (!_store.DeactivateSearch(id))
-            return NotFound($"Unknown device '{id}'.");
+        var snapshot = _store.DeactivateSearch(id);
+        if (snapshot is null) return NotFound($"Unknown device '{id}'.");
 
-        return Ok(_algorithm.Recommend(_store.GetState(id)!, _store.History(id), _store.EffectiveNow(id)));
+        return Ok(Recommend(snapshot));
     }
 
     /// <summary>Devices currently in an abnormal state — especially stuck in Active Tracking.</summary>
@@ -68,20 +67,23 @@ public class DevicesController : ControllerBase
     public ActionResult<IEnumerable<DeviationDto>> GetDeviations()
     {
         var deviations = new List<DeviationDto>();
-        foreach (var state in _store.AllStates())
+        foreach (var snapshot in _store.AllSnapshots())
         {
-            var now = _store.EffectiveNow(state.DeviceId);
-            var recommendation = _algorithm.Recommend(state, _store.History(state.DeviceId), now);
+            var recommendation = Recommend(snapshot);
             if (!recommendation.IsDeviation) continue;
 
+            var state = snapshot.State;
             deviations.Add(new DeviationDto(
                 state.DeviceId,
                 state.CurrentMode.ToString(),
                 state.BatteryPct,
                 recommendation.DeviationKind ?? "unknown",
-                Math.Round((now - state.ModeStartedAt).TotalHours, 1),
+                Math.Round((snapshot.Now - state.ModeStartedAt).TotalHours, 1),
                 recommendation));
         }
         return Ok(deviations);
     }
+
+    private ModeRecommendation Recommend(DeviceSnapshot snapshot) =>
+        _algorithm.Recommend(snapshot.State, snapshot.History, snapshot.Now);
 }

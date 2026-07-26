@@ -17,4 +17,26 @@ public class DeviceState
     public int TargetBatteryHours { get; set; }
     public ActiveSearch? ActiveSearch { get; set; }
     public string Timezone { get; set; } = "UTC";
+
+    /// <summary>Detached copy, for handing out a <see cref="DeviceSnapshot"/> that later
+    /// mutations can't reach into. Only the store should call this, and only under its lock.
+    /// <see cref="Position"/> and <see cref="ActiveSearch"/> are immutable records, so they
+    /// can be shared; the wifi list is copied because it isn't.</summary>
+    public DeviceState Clone() => new()
+    {
+        DeviceId = DeviceId,
+        At = At,
+        BatteryPct = BatteryPct,
+        CurrentMode = CurrentMode,
+        CurrentIntervalSeconds = CurrentIntervalSeconds,
+        CurrentStepThreshold = CurrentStepThreshold,
+        CurrentFallbackIntervalSeconds = CurrentFallbackIntervalSeconds,
+        ModeStartedAt = ModeStartedAt,
+        WifiVisibleNow = new List<string>(WifiVisibleNow),
+        InWifiSaver = InWifiSaver,
+        LastKnownPosition = LastKnownPosition,
+        TargetBatteryHours = TargetBatteryHours,
+        ActiveSearch = ActiveSearch,
+        Timezone = Timezone,
+    };
 }
