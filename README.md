@@ -45,6 +45,8 @@ calls against two singletons and shape the response DTOs. Those two singletons a
   and its sorted position-report history, and applies mutations (config changes, search on/off) under
   a lock. In a real deployment this would be a database plus a live stream of device reports; here it's
   just in-memory. I kept the two responsibilities apart on purpose so the interesting part stays pure.
+  `DeviceState` is mutable and never leaves the store: readers get a detached `DeviceSnapshot` built
+  inside the lock (see *Race conditions* below).
 
 - **`TrackingAlgorithm` (decisions)** — takes `(state, history, now)` and returns a recommendation.
   No I/O, no shared state, so it's easy to reason about and would be easy to test. **This is where the
@@ -89,9 +91,23 @@ know about it (via `DeviceStore.EffectiveNow`). The algorithm is always given th
 
 The brief deliberately leaves the hard numbers and some system questions open. Our stances:
 
-- **Battery model** — a simple `%/hour` drain estimate (`EstimateDrainPctPerHour`) where cost scales with
-  fix frequency: Active Tracking pinned high, WiFi Saver near zero, WM8/WM9 driven by interval/fallback.
-  Enough to populate "expected battery hours"; not claimed to be physically exact.
+- **Battery model** — `drain = idle + (cost of a GPS fix) × (fixes per hour)`, with a *ceiling* on the GPS
+  term. The constants are calibrated against the dataset, whose fractional battery values make drain
+  measurable: `active_tracking ≈ 13.9 %/h`, `WM9 ≈ 1.6–5.0 %/h`, `wifi_saver ≈ 1.2 %/h`. The ceiling is
+  the part worth arguing about: a naive linear per-fix model prices Active Tracking at 240 cold fixes an
+  hour and predicts ~60 %/h — four times reality. Below about a 70-second interval the receiver never
+  powers down between fixes, so there's no cold-acquisition cost to pay and the drain saturates.
+- **Target battery hours → parameters** — *derived from the battery model, not hard-coded.* For a given
+  target we search the device's allowed parameter values and take the most frequent reporting that still
+  survives the target from a full charge. This started as a hand-written lookup table, and deriving it is
+  what exposed that the table was wrong: it claimed a 5-minute WM8 interval "meets the 24h target" while
+  the model priced that same interval at 12 hours. Two consequences worth noting:
+  - **72h is unreachable with GPS on** — even a 30-min WM8 interval only gets to ~67h. The service now
+    says so in the rationale rather than silently claiming the target is met; closing the gap requires
+    WiFi Saver time at home.
+  - The model prefers a **low** WM9 step threshold with a **long** fallback — the opposite of the table's
+    original guess. Step-triggered fixes only fire when the resident actually moves, which is exactly when
+    you want them; the fallback timer is what costs battery while they sit still.
 - **Car detection** — speed ≥ 15 km/h with a flat step counter over the recent window. Deliberately low so
   we err toward *not losing* someone in a vehicle.
 - **Stuck-in-Active-Tracking threshold** — 30 min of Active Tracking with no active search. Below that it's
@@ -101,9 +117,17 @@ The brief deliberately leaves the hard numbers and some system questions open. O
 - **System holes** — *Persistence:* in-memory is fine for the case; production would be a DB plus a live
   report stream (the `DeviceStore` seam is already shaped for that). *Real-time vs. batch:* recompute on
   demand per request — the algorithm is cheap and pure, so a nightly batch would only add staleness.
-  *Race conditions:* state mutations run under a single lock in `DeviceStore`; a deactivate-search and a
-  recommendation can't interleave mid-decision. *Time zones:* devices carry an IANA zone (`Europe/Copenhagen`)
-  for future time-of-day patterns — see the limitation below.
+  *Time zones:* devices carry an IANA zone (`Europe/Copenhagen`) for future time-of-day patterns — see the
+  limitation below.
+- **Race conditions** — the brief's example is a deactivate-search landing while the algorithm has decided
+  to stay in Active Tracking. Taking the lock around *mutations* alone isn't enough, because the algorithm
+  reads state field by field: handed the live `DeviceState`, it can observe `ActiveSearch` already set but
+  `CurrentMode` not yet updated, and decide against a state that never existed. So reads are locked too,
+  and what leaves the store is an immutable `DeviceSnapshot` (state copy + history + the matching "now")
+  built in one critical section. The mutating endpoints return the snapshot from *their own* critical
+  section, so the recommendation a caller gets back is the one for the state its call actually produced.
+  Every decision therefore has a definite serialization point: strictly before, or strictly after, the
+  competing event — never halfway through it.
 
 **Known limitation:** the algorithm currently reasons over a ~30-minute recent window, not the full 14-day
 history. Per-resident time-of-day / weekday baselines (interpreted in the device's local time zone) are the
@@ -117,7 +141,11 @@ history to isolate one branch — no HTTP, no fixtures. The branches the brief c
 stuck-in-Active-Tracking detection (and the wind-down grace period that must *not* trip it), search timeout,
 car detection, the WiFi-Saver → normal-mode wake-up, mode-transition timing (no stale parameters carried
 across a switch), and the anti-thrashing cooldown (held within the window, flips after it, bypassed by car
-detection). `DeviceStoreTests` cover parsing the mixed numeric/string encodings in the dataset.
+detection). Two more guard the fixes above: the derived parameter table must either meet each battery
+target or say out loud that it can't, and the drain constants must stay within range of what the dataset
+actually shows. `DeviceStoreTests` cover parsing the mixed numeric/string encodings, plus snapshot
+isolation — including a concurrent activate/deactivate loop asserting a reader never sees an activated
+search without Active Tracking already applied.
 
 ## AI usage note
 
