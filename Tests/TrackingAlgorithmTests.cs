@@ -133,6 +133,104 @@ public class TrackingAlgorithmTests
         Assert.Equal(300, r.IntervalSeconds); // 24h profile fixed interval
     }
 
+    // --- 6. WiFi Saver -> normal mode transition (must be immediate) ------
+
+    [Fact]
+    public void WifiSaverButWifiDropped_ImmediatelyPicksNormalMode()
+    {
+        // Person just left home: still flagged InWifiSaver, but no wifi is visible anymore.
+        var state = Device(mode: TrackingMode.WifiSaver);
+        state.InWifiSaver = true;
+        state.WifiVisibleNow = new List<string>(); // wifi gone
+        var history = new[]
+        {
+            Report(Now.AddMinutes(-10), speedKmh: 4, stepsToday: 100),
+            Report(Now.AddMinutes(-3), speedKmh: 4, stepsToday: 190),
+        };
+
+        var r = _algo.Recommend(state, history, Now);
+
+        // No lingering in WiFi Saver, and a concrete normal mode with real parameters.
+        Assert.NotEqual(nameof(TrackingMode.WifiSaver), r.RecommendedMode);
+        Assert.Equal(nameof(TrackingMode.WorkingMode9), r.RecommendedMode);
+        Assert.NotNull(r.StepThreshold);
+        Assert.False(r.IsDeviation);
+    }
+
+    // --- 7. Mode-transition timing: no stale parameters carried over ------
+
+    [Fact]
+    public void SwitchingWm9ToWm8_DropsWm9FallbackImmediately()
+    {
+        // Car case forces WM9 -> WM8. The result must be WM8's fixed interval with NO
+        // WM9 fallback lingering (the mode-transition-lag pitfall from the brief).
+        var state = Device(mode: TrackingMode.WorkingMode9);
+        var history = new[]
+        {
+            Report(Now.AddMinutes(-10), speedKmh: 40, stepsToday: 500),
+            Report(Now.AddMinutes(-3), speedKmh: 45, stepsToday: 500),
+        };
+
+        var r = _algo.Recommend(state, history, Now);
+
+        Assert.Equal(nameof(TrackingMode.WorkingMode8), r.RecommendedMode);
+        Assert.NotNull(r.IntervalSeconds);
+        Assert.Null(r.StepThreshold);
+        Assert.Null(r.FallbackIntervalSeconds);
+    }
+
+    // --- 8. Anti-thrashing: cooldown holds a battery-only flip -----------
+
+    [Fact]
+    public void ComfortFlip_WithinCooldown_HoldsCurrentMode()
+    {
+        // In WM9 for only 5 min; the person is now sitting still (would suggest WM8).
+        // The cooldown should keep it in WM9 to avoid flapping.
+        var state = Device(mode: TrackingMode.WorkingMode9, modeStartedAt: Now.AddMinutes(-5));
+        var history = new[]
+        {
+            Report(Now.AddMinutes(-10), speedKmh: 0, stepsToday: 500),
+            Report(Now.AddMinutes(-3), speedKmh: 0, stepsToday: 500),
+        };
+
+        var r = _algo.Recommend(state, history, Now);
+
+        Assert.Equal(nameof(TrackingMode.WorkingMode9), r.RecommendedMode);
+        Assert.False(r.IsDeviation);
+    }
+
+    [Fact]
+    public void ComfortFlip_PastCooldown_SwitchesMode()
+    {
+        // Same signal, but the device has been in WM9 for 30 min — cooldown elapsed, flip allowed.
+        var state = Device(mode: TrackingMode.WorkingMode9, modeStartedAt: Now.AddMinutes(-30));
+        var history = new[]
+        {
+            Report(Now.AddMinutes(-10), speedKmh: 0, stepsToday: 500),
+            Report(Now.AddMinutes(-3), speedKmh: 0, stepsToday: 500),
+        };
+
+        var r = _algo.Recommend(state, history, Now);
+
+        Assert.Equal(nameof(TrackingMode.WorkingMode8), r.RecommendedMode);
+    }
+
+    [Fact]
+    public void CarDetection_BypassesCooldown_SwitchesImmediately()
+    {
+        // Only 2 min in WM9, but a car is detected — safety wins over the cooldown.
+        var state = Device(mode: TrackingMode.WorkingMode9, modeStartedAt: Now.AddMinutes(-2));
+        var history = new[]
+        {
+            Report(Now.AddMinutes(-8), speedKmh: 50, stepsToday: 800),
+            Report(Now.AddMinutes(-2), speedKmh: 55, stepsToday: 800),
+        };
+
+        var r = _algo.Recommend(state, history, Now);
+
+        Assert.Equal(nameof(TrackingMode.WorkingMode8), r.RecommendedMode);
+    }
+
     // --- helpers ----------------------------------------------------------
 
     private static readonly IReadOnlyList<PositionReport> NoHistory = Array.Empty<PositionReport>();
@@ -146,7 +244,9 @@ public class TrackingAlgorithmTests
         At = Now,
         BatteryPct = 80,
         CurrentMode = mode,
-        ModeStartedAt = modeStartedAt ?? Now,
+        // Default to "well past the cooldown" so mode-selection tests exercise the choice,
+        // not the anti-thrashing hold. Cooldown tests set a recent ModeStartedAt explicitly.
+        ModeStartedAt = modeStartedAt ?? Now.AddHours(-1),
         TargetBatteryHours = targetBatteryHours,
     };
 

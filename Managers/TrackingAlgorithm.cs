@@ -13,6 +13,11 @@ namespace StellaCareApi.Managers;
 ///   4. Home wifi still visible         -> WiFi Saver (device-managed, GPS off)
 ///   5. Otherwise                       -> WM8/WM9 based on movement + battery target
 ///
+/// Safety-critical transitions (into/out of Active Tracking, car detection, a WiFi-Saver
+/// wake-up) are always immediate. Only the battery-comfort WM8&lt;-&gt;WM9 flip is rate-limited by
+/// a cooldown, which is how we reconcile the brief's two opposing demands: avoid thrashing,
+/// yet transition instantly when it matters.
+///
 /// The numeric thresholds below are the deliberate "holes" from the brief — our own,
 /// documented assumptions (see README), not values handed to us.
 /// </summary>
@@ -22,6 +27,7 @@ public class TrackingAlgorithm : ITrackingAlgorithm
     private const int SearchAutoTimeoutMinutes = 120; // a search older than this should have closed
     private const int RecentWindowMinutes = 30;       // history window for car / movement detection
     private const int StuckActiveTrackingMinutes = 30; // grace period before "in Active Tracking, no search" counts as stuck
+    private const int ModeChangeCooldownMinutes = 15;  // min dwell before a battery-only WM8<->WM9 flip (anti-thrashing)
 
     public ModeRecommendation Recommend(DeviceState s, IReadOnlyList<PositionReport> history, DateTimeOffset now)
     {
@@ -35,7 +41,7 @@ public class TrackingAlgorithm : ITrackingAlgorithm
                 return Build(s, TrackingMode.ActiveTracking, 15, null, null, false, null,
                     $"Active search in progress ({age.TotalMinutes:F0} min). Active Tracking overrides the {s.TargetBatteryHours}h battery target.");
 
-            var afterTimeout = ChooseNormalMode(s, recent);
+            var afterTimeout = ChooseNormalMode(s, recent, now);
             return afterTimeout with
             {
                 IsDeviation = true,
@@ -52,7 +58,7 @@ public class TrackingAlgorithm : ITrackingAlgorithm
         if (s.CurrentMode == TrackingMode.ActiveTracking)
         {
             var stuckFor = now - s.ModeStartedAt;
-            var normal = ChooseNormalMode(s, recent);
+            var normal = ChooseNormalMode(s, recent, now);
 
             if (stuckFor <= TimeSpan.FromMinutes(StuckActiveTrackingMinutes))
                 return normal with
@@ -77,34 +83,60 @@ public class TrackingAlgorithm : ITrackingAlgorithm
                 "Algorithm picks WM8/WM9 immediately once wifi drops.");
 
         // 5. Normal selection (also covers wifi-saver-just-dropped and the car case).
-        return ChooseNormalMode(s, recent);
+        return ChooseNormalMode(s, recent, now);
     }
 
     /// <summary>Pick WM8 vs WM9 and parameters from movement context + battery target.</summary>
-    private ModeRecommendation ChooseNormalMode(DeviceState s, IReadOnlyList<PositionReport> recent)
+    private ModeRecommendation ChooseNormalMode(DeviceState s, IReadOnlyList<PositionReport> recent, DateTimeOffset now)
     {
         var profile = TargetProfile(s.TargetBatteryHours);
 
-        // Car detection: recent high speed with a flat step counter. WM9 can't track a vehicle.
+        // Car detection: recent high speed with a flat step counter. WM9 can't track a vehicle,
+        // so this is safety-critical and bypasses the anti-thrashing cooldown below.
         var highSpeed = recent.Any(r => r.SpeedKmh >= CarSpeedKmh);
         if (highSpeed && StepsFlat(recent))
         {
             var carInterval = Math.Min(profile.Interval, 180); // cap at 3 min while moving fast
-            return Build(s, TrackingMode.WorkingMode8, carInterval, null, null, false, null,
+            return BuildNormal(s, TrackingMode.WorkingMode8, carInterval, profile,
                 $"Likely car trip (speed ≥ {CarSpeedKmh:F0} km/h, step counter flat). " +
                 $"WM9 would lose them — switch to WM8 {carInterval / 60}-min fixed interval.");
         }
 
-        // On-foot mover => WM9 (position when they actually walk, efficient).
-        if (IsMover(recent))
-            return Build(s, TrackingMode.WorkingMode9, null, profile.StepThreshold, profile.Fallback, false, null,
-                $"Moving on foot; WM9 (every {profile.StepThreshold} steps, {profile.Fallback / 60}-min fallback) " +
-                $"fits the {s.TargetBatteryHours}h battery target.");
+        // The battery-comfort choice: WM9 for on-foot movers, WM8 when mostly still.
+        var desired = IsMover(recent) ? TrackingMode.WorkingMode9 : TrackingMode.WorkingMode8;
 
-        // Mostly still => WM8 fixed interval.
-        return Build(s, TrackingMode.WorkingMode8, profile.Interval, null, null, false, null,
-            $"Mostly stationary; WM8 {profile.Interval / 60}-min fixed interval meets the {s.TargetBatteryHours}h battery target.");
+        // Anti-thrashing (hysteresis): if the device is already sitting in a steady working
+        // mode and the *only* reason to switch is this comfort signal, hold the current mode
+        // until the cooldown elapses. Transitions into a normal mode from Active Tracking or
+        // WiFi Saver land here with CurrentMode != WM8/WM9, so wake-ups are never suppressed —
+        // that keeps the fast-transition guarantee for the cases that actually matter.
+        var inSteadyWorkingMode = s.CurrentMode is TrackingMode.WorkingMode8 or TrackingMode.WorkingMode9;
+        var timeInMode = now - s.ModeStartedAt;
+        if (inSteadyWorkingMode && desired != s.CurrentMode &&
+            timeInMode < TimeSpan.FromMinutes(ModeChangeCooldownMinutes))
+        {
+            return BuildNormal(s, s.CurrentMode, null, profile,
+                $"Movement suggests {desired}, but only {timeInMode.TotalMinutes:F0} min in {s.CurrentMode} " +
+                $"(< {ModeChangeCooldownMinutes}-min cooldown) — holding to avoid thrashing.");
+        }
+
+        return desired == TrackingMode.WorkingMode9
+            ? BuildNormal(s, TrackingMode.WorkingMode9, null, profile,
+                $"Moving on foot; WM9 (every {profile.StepThreshold} steps, {profile.Fallback / 60}-min fallback) " +
+                $"fits the {s.TargetBatteryHours}h battery target.")
+            : BuildNormal(s, TrackingMode.WorkingMode8, profile.Interval, profile,
+                $"Mostly stationary; WM8 {profile.Interval / 60}-min fixed interval meets the {s.TargetBatteryHours}h battery target.");
     }
+
+    /// <summary>Build a WM8 or WM9 recommendation with parameters from the target profile.
+    /// Switching to WM8 clears WM9's step/fallback (and vice-versa) so a transition never
+    /// carries the previous mode's stale parameters — the mode-transition-lag pitfall.</summary>
+    private static ModeRecommendation BuildNormal(
+        DeviceState s, TrackingMode mode, int? intervalOverride,
+        (int Interval, int StepThreshold, int Fallback) profile, string rationale) =>
+        mode == TrackingMode.WorkingMode8
+            ? Build(s, TrackingMode.WorkingMode8, intervalOverride ?? profile.Interval, null, null, false, null, rationale)
+            : Build(s, TrackingMode.WorkingMode9, null, profile.StepThreshold, profile.Fallback, false, null, rationale);
 
     /// <summary>Map the desired battery life to concrete mode parameters (all values valid per the brief).</summary>
     private static (int Interval, int StepThreshold, int Fallback) TargetProfile(int targetHours) => targetHours switch
